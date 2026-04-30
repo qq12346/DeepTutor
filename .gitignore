@@ -287,3 +287,6 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+# local virtual environment
+.venv/

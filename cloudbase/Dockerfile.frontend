@@ -1,0 +1,34 @@
+FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-builder
+
+WORKDIR /app/web
+
+ARG APP_VERSION=""
+ENV APP_VERSION=$APP_VERSION
+
+COPY web/package.json web/package-lock.json* ./
+RUN npm config set fetch-timeout 600000 && \
+    npm config set fetch-retries 5 && \
+    npm ci --legacy-peer-deps
+
+COPY web/ ./
+RUN echo "NEXT_PUBLIC_API_BASE=__NEXT_PUBLIC_API_BASE_PLACEHOLDER__" > .env.local
+RUN npm run build
+
+FROM node:22-slim AS runtime
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=frontend-builder /app/web/.next/standalone/ ./web/
+COPY --from=frontend-builder /app/web/.next/static/ ./web/.next/static/
+COPY --from=frontend-builder /app/web/public/ ./web/public/
+COPY cloudbase/start-frontend.sh /app/start-frontend.sh
+
+RUN chmod +x /app/start-frontend.sh
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD /bin/bash -lc 'curl -f http://localhost:${PORT:-8080}/ || exit 1'
+
+ENTRYPOINT ["/app/start-frontend.sh"]
