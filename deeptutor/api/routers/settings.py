@@ -8,6 +8,7 @@ UI preferences, configuration catalog management, and detailed streamed tests.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import time
 from typing import Any, List, Literal, Optional
@@ -70,6 +71,76 @@ class SidebarNavOrderUpdate(BaseModel):
 
 class CatalogPayload(BaseModel):
     catalog: dict[str, Any]
+
+
+MASKED_SECRET = "********"
+SENSITIVE_ENV_KEYS = {"LLM_API_KEY", "EMBEDDING_API_KEY", "SEARCH_API_KEY"}
+
+
+def _mask_secret(value: Any) -> str:
+    return MASKED_SECRET if str(value or "").strip() else ""
+
+
+def _is_masked_secret(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and set(text) == {"*"}
+
+
+def _sanitize_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
+    sanitized = deepcopy(catalog)
+    services = sanitized.get("services") or {}
+    for service in services.values():
+        profiles = service.get("profiles") or []
+        for profile in profiles:
+            if isinstance(profile, dict) and "api_key" in profile:
+                profile["api_key"] = _mask_secret(profile.get("api_key"))
+    return sanitized
+
+
+def _sanitize_env(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (_mask_secret(value) if key in SENSITIVE_ENV_KEYS else value)
+        for key, value in values.items()
+    }
+
+
+def _restore_masked_catalog_secrets(
+    catalog: dict[str, Any],
+    persisted_catalog: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    restored = deepcopy(catalog)
+    current = persisted_catalog or get_model_catalog_service().load()
+    current_services = current.get("services") or {}
+    restored_services = restored.get("services") or {}
+
+    for service_name, service in restored_services.items():
+        profiles = service.get("profiles") or []
+        current_profiles = (current_services.get(service_name) or {}).get("profiles") or []
+        current_by_id = {
+            profile.get("id"): profile
+            for profile in current_profiles
+            if isinstance(profile, dict) and profile.get("id") is not None
+        }
+        for index, profile in enumerate(profiles):
+            if not isinstance(profile, dict) or not _is_masked_secret(profile.get("api_key")):
+                continue
+            source = current_by_id.get(profile.get("id"))
+            if source is None and index < len(current_profiles):
+                source = current_profiles[index]
+            profile["api_key"] = str((source or {}).get("api_key") or "")
+
+    return restored
+
+
+def _sanitize_event(event: dict[str, Any]) -> dict[str, Any]:
+    sanitized = deepcopy(event)
+    catalog = sanitized.get("catalog")
+    if isinstance(catalog, dict):
+        sanitized["catalog"] = _sanitize_catalog(catalog)
+    env = sanitized.get("env")
+    if isinstance(env, dict):
+        sanitized["env"] = _sanitize_env(env)
+    return sanitized
 
 
 def _invalidate_runtime_caches() -> None:
@@ -145,32 +216,40 @@ def _provider_choices() -> dict[str, list[dict[str, str]]]:
 async def get_settings():
     return {
         "ui": load_ui_settings(),
-        "catalog": get_model_catalog_service().load(),
+        "catalog": _sanitize_catalog(get_model_catalog_service().load()),
         "providers": _provider_choices(),
     }
 
 
 @router.get("/catalog")
 async def get_catalog():
-    return {"catalog": get_model_catalog_service().load()}
+    return {"catalog": _sanitize_catalog(get_model_catalog_service().load())}
 
 
 @router.put("/catalog")
 async def update_catalog(payload: CatalogPayload):
-    catalog = get_model_catalog_service().save(payload.catalog)
+    persisted_catalog = get_model_catalog_service().load()
+    catalog = get_model_catalog_service().save(
+        _restore_masked_catalog_secrets(payload.catalog, persisted_catalog)
+    )
     _invalidate_runtime_caches()
-    return {"catalog": catalog}
+    return {"catalog": _sanitize_catalog(catalog)}
 
 
 @router.post("/apply")
 async def apply_catalog(payload: CatalogPayload | None = None):
-    catalog = payload.catalog if payload is not None else get_model_catalog_service().load()
+    persisted_catalog = get_model_catalog_service().load()
+    catalog = (
+        _restore_masked_catalog_secrets(payload.catalog, persisted_catalog)
+        if payload is not None
+        else persisted_catalog
+    )
     rendered = get_model_catalog_service().apply(catalog)
     _invalidate_runtime_caches()
     return {
         "message": "Catalog applied to the active .env configuration.",
-        "catalog": get_model_catalog_service().load(),
-        "env": rendered,
+        "catalog": _sanitize_catalog(get_model_catalog_service().load()),
+        "env": _sanitize_env(rendered),
     }
 
 
@@ -245,7 +324,13 @@ async def update_sidebar_nav_order(update: SidebarNavOrderUpdate):
 
 @router.post("/tests/{service}/start")
 async def start_service_test(service: str, payload: CatalogPayload | None = None):
-    run = get_config_test_runner().start(service, payload.catalog if payload else None)
+    persisted_catalog = get_model_catalog_service().load()
+    catalog = (
+        _restore_masked_catalog_secrets(payload.catalog, persisted_catalog)
+        if payload
+        else None
+    )
+    run = get_config_test_runner().start(service, catalog)
     return {"run_id": run.id}
 
 
@@ -262,7 +347,7 @@ async def stream_service_test_events(service: str, run_id: str, request: Request
             events = run.snapshot(sent)
             if events:
                 for event in events:
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(_sanitize_event(event), ensure_ascii=False)}\n\n"
                 sent += len(events)
                 if events[-1]["type"] in {"completed", "failed"}:
                     return
@@ -305,7 +390,12 @@ class TourCompletePayload(BaseModel):
 
 @router.post("/tour/complete")
 async def complete_tour(payload: TourCompletePayload | None = None):
-    catalog = payload.catalog if payload and payload.catalog else get_model_catalog_service().load()
+    persisted_catalog = get_model_catalog_service().load()
+    catalog = (
+        _restore_masked_catalog_secrets(payload.catalog, persisted_catalog)
+        if payload and payload.catalog
+        else persisted_catalog
+    )
     rendered = get_model_catalog_service().apply(catalog)
     _invalidate_runtime_caches()
     now = int(time.time())
@@ -329,7 +419,7 @@ async def complete_tour(payload: TourCompletePayload | None = None):
         "message": "Configuration saved. DeepTutor will restart shortly.",
         "launch_at": launch_at,
         "redirect_at": redirect_at,
-        "env": rendered,
+        "env": _sanitize_env(rendered),
     }
 
 

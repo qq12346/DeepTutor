@@ -240,7 +240,9 @@ async def test_update_catalog_invalidates_runtime_caches(monkeypatch: pytest.Mon
     new_llm_client = llm_client_module.get_llm_client()
     new_embedding_client = embedding_client_module.get_embedding_client()
 
-    assert response == {"catalog": updated_catalog}
+    assert service.load() == updated_catalog
+    assert response["catalog"]["services"]["llm"]["profiles"][0]["api_key"] != "new-llm-key"
+    assert response["catalog"]["services"]["embedding"]["profiles"][0]["api_key"] != "new-embedding-key"
     assert old_llm_config.model == "gpt-old"
     assert new_llm_config.model == "gpt-new"
     assert new_llm_config.base_url == "https://new-llm.example/v1"
@@ -285,9 +287,13 @@ async def test_apply_catalog_invalidates_runtime_caches(monkeypatch: pytest.Monk
     new_llm_client = llm_client_module.get_llm_client()
     new_embedding_client = embedding_client_module.get_embedding_client()
 
-    assert response["catalog"] == applied_catalog
+    assert service.load() == applied_catalog
+    assert response["catalog"]["services"]["llm"]["profiles"][0]["api_key"] != "after-apply-llm-key"
+    assert response["catalog"]["services"]["embedding"]["profiles"][0]["api_key"] != "after-apply-embedding-key"
     assert response["env"]["LLM_MODEL"] == "gpt-after-apply"
     assert response["env"]["EMBEDDING_MODEL"] == "text-embedding-after-apply"
+    assert response["env"]["LLM_API_KEY"] != "after-apply-llm-key"
+    assert response["env"]["EMBEDDING_API_KEY"] != "after-apply-embedding-key"
     assert new_llm_config.model == "gpt-after-apply"
     assert new_llm_client is not old_llm_client
     assert new_llm_client.config.base_url == "https://after-apply-llm.example/v1"
@@ -337,8 +343,42 @@ async def test_complete_tour_invalidates_runtime_caches(
 
     assert response["env"]["LLM_MODEL"] == "gpt-after-tour"
     assert response["env"]["EMBEDDING_MODEL"] == "text-embedding-after-tour"
+    assert response["env"]["LLM_API_KEY"] != "after-tour-llm-key"
+    assert response["env"]["EMBEDDING_API_KEY"] != "after-tour-embedding-key"
     assert response["status"] == "completed"
     assert new_llm_config.model == "gpt-after-tour"
     assert new_llm_client is not old_llm_client
     assert new_embedding_client is not old_embedding_client
     assert '"status": "completed"' in cache
+
+
+@pytest.mark.asyncio
+async def test_settings_round_trip_masks_api_keys_and_preserves_saved_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_catalog = _build_catalog(
+        llm_model="gpt-live",
+        llm_base_url="https://live-llm.example/v1",
+        llm_api_key="live-llm-key",
+        embedding_model="text-embedding-live",
+        embedding_base_url="https://live-embedding.example/v1",
+        embedding_api_key="live-embedding-key",
+    )
+    service = _FakeCatalogService(initial_catalog)
+    _patch_runtime(monkeypatch, service)
+
+    settings_payload = await settings_router.get_settings()
+    masked_catalog = settings_payload["catalog"]
+
+    assert masked_catalog["services"]["llm"]["profiles"][0]["api_key"] != "live-llm-key"
+    assert masked_catalog["services"]["embedding"]["profiles"][0]["api_key"] != "live-embedding-key"
+
+    response = await settings_router.apply_catalog(
+        settings_router.CatalogPayload(catalog=masked_catalog)
+    )
+
+    persisted = service.load()
+    assert persisted["services"]["llm"]["profiles"][0]["api_key"] == "live-llm-key"
+    assert persisted["services"]["embedding"]["profiles"][0]["api_key"] == "live-embedding-key"
+    assert response["env"]["LLM_API_KEY"] != "live-llm-key"
+    assert response["env"]["EMBEDDING_API_KEY"] != "live-embedding-key"
